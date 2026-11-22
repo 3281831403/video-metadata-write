@@ -13,9 +13,114 @@
 * 元数据标签使用 UTF-8 文本，长度前缀是**字节数**，不是字符数。
 """
 
+import os
+import struct
+import tempfile
+
+_HEADER_SIZE = 8
+_EXT_HEADER_SIZE = 16
+_CONTAINER_TYPES = frozenset({"moov", "trak", "mdia", "minf", "stbl"})
+_METADATA_TYPES = frozenset({"udta", "meta"})
+
 
 class MetaError(Exception):
     """MP4 元数据操作的可预期错误：结构损坏、路径缺失、批量回滚等。"""
+
+
+def _parse_region(data: bytes, start: int, end: int, strict: bool) -> list[dict]:
+    """在 ``data[start:end]`` 区间内解析一串同级 box。
+
+    ``strict`` 为真时用于顶层链：任何结构错误都抛 ``MetaError``；为假时用于
+    容器子级：遇到无法继续解析的位置就停止，尽量保留已经解析出的子 box
+    （例如占位符 ``moov/trak`` 中的全零 payload）。``offset`` 始终使用
+    ``data`` 中的绝对偏移。
+    """
+
+    boxes: list[dict] = []
+    offset = start
+
+    while offset < end:
+        remaining = end - offset
+
+        # 文件（或容器 payload）末尾的 1 字节填充。
+        if remaining == 1:
+            break
+        # 2..7 字节无法构成一个完整头部。
+        if remaining < _HEADER_SIZE:
+            if strict:
+                raise MetaError(f"truncated box header at offset {offset}")
+            break
+
+        size = struct.unpack_from(">I", data, offset)[0]
+        box_type = data[offset + 4:offset + 8].decode("latin-1")
+
+        # size == 0 会让游标无法推进；绝不能继续循环。
+        if size == 0:
+            if strict:
+                raise MetaError(f"invalid box size 0 at offset {offset}")
+            break
+
+        if size == 1:
+            # 64 位扩展头：还需要 8 字节 largesize。
+            if remaining < _EXT_HEADER_SIZE:
+                if strict:
+                    raise MetaError(
+                        f"truncated 64-bit box header at offset {offset}"
+                    )
+                break
+            header_size = _EXT_HEADER_SIZE
+            declared = struct.unpack_from(">Q", data, offset + 8)[0]
+            if declared < _EXT_HEADER_SIZE:
+                if strict:
+                    raise MetaError(
+                        f"invalid box size {declared} at offset {offset}"
+                    )
+                break
+        else:
+            header_size = _HEADER_SIZE
+            declared = size
+            if declared < _HEADER_SIZE:
+                if strict:
+                    raise MetaError(
+                        f"invalid box size {declared} at offset {offset}"
+                    )
+                break
+
+        available = end - offset
+        if declared > available:
+            # 超过 1 字节才算越界；越界时 payload 截断到区间末尾。
+            truncated = declared - available > 1
+            box_end = end
+        else:
+            truncated = False
+            box_end = offset + declared
+
+        payload = data[offset + header_size:box_end]
+
+        children: list[dict] = []
+        if box_type in _CONTAINER_TYPES:
+            # 子级按宽松模式解析，避免占位/损坏的子结构让整棵树不可读。
+            children = _parse_region(
+                data, offset + header_size, box_end, strict=False
+            )
+
+        boxes.append(
+            {
+                "type": box_type,
+                "size": declared,
+                "header_size": header_size,
+                "offset": offset,
+                "payload": payload,
+                "truncated": truncated,
+                "children": children,
+            }
+        )
+
+        if truncated:
+            break
+        offset += declared
+
+    return boxes
 
 
 def read_boxes(data: bytes) -> list[dict]:
@@ -48,7 +153,10 @@ def read_boxes(data: bytes) -> list[dict]:
 
     空输入返回 ``[]``。函数只读，不得修改 ``data``。
     """
-    raise NotImplementedError
+
+    if not data:
+        return []
+    return _parse_region(data, 0, len(data), strict=True)
 
 
 def find_box(boxes: list[dict], path: list[str]) -> dict | None:
@@ -58,7 +166,18 @@ def find_box(boxes: list[dict], path: list[str]) -> dict | None:
     返回 ``read_boxes`` 结果中的同一个 dict（不复制、不改写）。路径为空、任一层
     缺失或 ``children`` 为空时返回 ``None``。
     """
-    raise NotImplementedError
+
+    if not path:
+        return None
+
+    current = boxes
+    found: dict | None = None
+    for name in path:
+        found = next((box for box in current if box["type"] == name), None)
+        if found is None:
+            return None
+        current = found["children"]
+    return found
 
 
 def build_udta(tags: dict[str, str]) -> bytes:
@@ -76,7 +195,77 @@ def build_udta(tags: dict[str, str]) -> bytes:
     ``tags`` 为空时返回只有 8 字节 ``udta`` 头的 box；键编码后不是 4 字节、
     值不是 ``str`` 时抛 ``MetaError``。
     """
-    raise NotImplementedError
+
+    parts: list[bytes] = []
+
+    for name, value in tags.items():
+        if not isinstance(value, str):
+            raise MetaError(f"tag value for {name!r} must be a str")
+
+        try:
+            name_bytes = name.encode("latin-1")
+        except (AttributeError, UnicodeEncodeError) as exc:
+            raise MetaError(f"invalid tag name: {name!r}") from exc
+
+        if len(name_bytes) != 4:
+            raise MetaError(f"tag name {name!r} must encode to exactly 4 bytes")
+
+        value_bytes = value.encode("utf-8")
+        if len(value_bytes) > 0xFFFF:
+            raise MetaError(f"tag value for {name!r} is too long")
+
+        child_size = _HEADER_SIZE + 2 + len(value_bytes)
+        parts.append(
+            struct.pack(">I", child_size)
+            + name_bytes
+            + struct.pack(">H", len(value_bytes))
+            + value_bytes
+        )
+
+    payload = b"".join(parts)
+    return struct.pack(">I", _HEADER_SIZE + len(payload)) + b"udta" + payload
+
+
+def _declared_size_of_box(box: bytes) -> int:
+    """返回一个完整 box 头部声明的总长度，并校验它与 ``len(box)`` 一致。"""
+
+    if not isinstance(box, (bytes, bytearray, memoryview)):
+        raise MetaError("new box must be bytes")
+    box = bytes(box)
+
+    if len(box) < _HEADER_SIZE:
+        raise MetaError("new box is shorter than 8 bytes")
+
+    size = struct.unpack_from(">I", box, 0)[0]
+    if size == 1:
+        if len(box) < _EXT_HEADER_SIZE:
+            raise MetaError("new box has a truncated 64-bit header")
+        declared = struct.unpack_from(">Q", box, 8)[0]
+    else:
+        declared = size
+
+    if declared != len(box):
+        raise MetaError(
+            f"new box declares {declared} bytes but is {len(box)} bytes long"
+        )
+    return declared
+
+
+def _find_chain(boxes: list[dict], path: list[str]) -> list[dict] | None:
+    """沿 ``path`` 返回由外到内的 box 列表（最后一项目标 box）。"""
+
+    if not path:
+        return None
+
+    chain: list[dict] = []
+    current = boxes
+    for name in path:
+        match = next((box for box in current if box["type"] == name), None)
+        if match is None:
+            return None
+        chain.append(match)
+        current = match["children"]
+    return chain
 
 
 def replace_box(data: bytes, path: list[str], new_box: bytes) -> bytes:
@@ -91,7 +280,41 @@ def replace_box(data: bytes, path: list[str], new_box: bytes) -> bytes:
     * 返回完整的新的 ``bytes``；替换后必须能被 :func:`read_boxes` 正常解析，
       且父 box 的 ``size`` 等于其头部加所有子 box 的总长度。
     """
-    raise NotImplementedError
+
+    new_size = _declared_size_of_box(new_box)
+
+    boxes = read_boxes(data)
+    chain = _find_chain(boxes, path)
+    if chain is None:
+        raise MetaError(f"box path not found: {path}")
+
+    target = chain[-1]
+    old_size = target["size"]
+    delta = new_size - old_size
+
+    start = target["offset"]
+    end = start + old_size
+
+    out = bytearray(data[:start])
+    out.extend(new_box)
+    out.extend(data[end:])
+
+    # 祖先都在目标之前，字节位置不受本次增删影响。
+    for ancestor in chain[:-1]:
+        new_ancestor_size = ancestor["size"] + delta
+        if new_ancestor_size < 0:
+            raise MetaError(f"replacement makes box {ancestor['type']} too small")
+
+        if ancestor["header_size"] == _EXT_HEADER_SIZE:
+            struct.pack_into(">Q", out, ancestor["offset"] + 8, new_ancestor_size)
+        else:
+            if new_ancestor_size > 0xFFFFFFFF:
+                raise MetaError(
+                    f"box {ancestor['type']} is too large for a 32-bit size"
+                )
+            struct.pack_into(">I", out, ancestor["offset"], new_ancestor_size)
+
+    return bytes(out)
 
 
 def atomic_write(path, data: bytes) -> None:
@@ -107,7 +330,42 @@ def atomic_write(path, data: bytes) -> None:
     注意：测试会替换 ``os.replace`` 模拟断电，因此实现必须通过模块属性
     ``os.replace`` 调用，不能提前绑定为局部名。
     """
-    raise NotImplementedError
+
+    fspath = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(fspath))
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".mp4-write-", suffix=".part", dir=directory)
+    fileobj = None
+
+    try:
+        fileobj = os.fdopen(fd, "wb")
+        fd = -1  # 现在由 fileobj 负责关闭。
+        fileobj.write(data)
+        fileobj.flush()
+        os.fsync(fileobj.fileno())
+        fileobj.close()
+        fileobj = None
+
+        # 必须通过 os.replace 属性调用（测试会 monkeypatch 它）。
+        os.replace(tmp_path, fspath)
+        tmp_path = None
+    except BaseException:
+        if fileobj is not None:
+            try:
+                fileobj.close()
+            except OSError:
+                pass
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+        raise
 
 
 def strip_metadata(data: bytes) -> bytes:
@@ -120,7 +378,28 @@ def strip_metadata(data: bytes) -> bytes:
     结构非法（如 ``size == 0``）抛 ``MetaError``。替换后的父级长度不需要修正，
     因为删除的是顶层 box。
     """
-    raise NotImplementedError
+
+    boxes = read_boxes(data)
+
+    if not any(box["type"] in _METADATA_TYPES for box in boxes):
+        return data
+
+    parts: list[bytes] = []
+    covered = 0
+
+    for box in boxes:
+        end = min(box["offset"] + box["size"], len(data))
+        if end > covered:
+            covered = end
+        if box["type"] in _METADATA_TYPES:
+            continue
+        parts.append(data[box["offset"]:end])
+
+    # 保留末尾的 1 字节填充，确保“其余字节原样保留”。
+    if covered < len(data):
+        parts.append(data[covered:])
+
+    return b"".join(parts)
 
 
 def validate(data: bytes) -> list[str]:
@@ -141,7 +420,60 @@ def validate(data: bytes) -> list[str]:
     只校验顶层 box 链，不递归 ``children``；``udta`` 内部标签不参与类型检查。
     函数只读，不修改 ``data``。
     """
-    raise NotImplementedError
+
+    problems: list[str] = []
+    total = len(data)
+    offset = 0
+
+    while offset < total:
+        remaining = total - offset
+
+        if remaining == 1:
+            # 末尾 1 字节填充。
+            break
+        if remaining < _HEADER_SIZE:
+            problems.append(f"box ? at {offset}: truncated header")
+            break
+
+        size = struct.unpack_from(">I", data, offset)[0]
+        raw_type = data[offset + 4:offset + 8]
+        box_type = raw_type.decode("latin-1")
+
+        if size == 0:
+            raise MetaError(f"invalid box size 0 at offset {offset}")
+
+        if not all(0x20 <= byte <= 0x7E for byte in raw_type):
+            problems.append(f"box {box_type} at {offset}: non-ASCII type")
+
+        if size == 1:
+            if remaining < _EXT_HEADER_SIZE:
+                problems.append(f"box {box_type} at {offset}: truncated header")
+                break
+            declared = struct.unpack_from(">Q", data, offset + 8)[0]
+            if declared < _EXT_HEADER_SIZE:
+                problems.append(
+                    f"box {box_type} at {offset}: invalid size {declared}"
+                )
+                break
+        else:
+            declared = size
+            if declared < _HEADER_SIZE:
+                problems.append(
+                    f"box {box_type} at {offset}: invalid size {declared}"
+                )
+                break
+
+        if declared > remaining:
+            if declared - remaining > 1:
+                problems.append(f"box {box_type} at {offset}: out of bounds")
+                break
+            # 1 字节容差：视为合法，且已无法继续解析。
+            offset += declared
+            continue
+
+        offset += declared
+
+    return problems
 
 
 def write_batch(files: list, tags: dict[str, str]) -> dict:
@@ -161,4 +493,45 @@ def write_batch(files: list, tags: dict[str, str]) -> dict:
     返回 ``{"written": [str(path), ...], "count": n}``，``written`` 的顺序与
     ``files`` 完全一致，路径用 ``str(path)``。全部成功才返回。
     """
-    raise NotImplementedError
+
+    # 第一遍：读出所有原字节并校验，此时尚未写入任何文件。
+    originals: list[tuple[object, bytes]] = []
+
+    for path in files:
+        try:
+            with open(path, "rb") as handle:
+                original = handle.read()
+        except OSError as exc:
+            raise MetaError(f"failed to read {path}: {exc}") from exc
+
+        problems = validate(original)
+        if problems:
+            raise MetaError(f"invalid MP4 file {path}: {problems[0]}")
+
+        originals.append((path, original))
+
+    # 标签构造失败时也还没有任何写入。
+    udta = build_udta(tags)
+
+    written: list[tuple[object, bytes]] = []
+
+    try:
+        for path, original in originals:
+            boxes = read_boxes(original)
+            if any(box["type"] == "udta" for box in boxes):
+                new_data = replace_box(original, ["udta"], udta)
+            else:
+                new_data = original + udta
+
+            atomic_write(path, new_data)
+            written.append((path, original))
+    except Exception as exc:
+        # 回滚已经成功写入的文件；继续尝试其余文件，尽量恢复全部。
+        for path, original in written:
+            try:
+                atomic_write(path, original)
+            except Exception:
+                pass
+        raise MetaError(f"batch write failed: {exc}") from exc
+
+    return {"written": [str(path) for path, _ in originals], "count": len(originals)}
